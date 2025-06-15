@@ -29,7 +29,7 @@ CLIENT_SECRETS_FILE = "client_secrets.json"
 CREDENTIALS_PICKLE = "youtube_credentials.pkl"
 
 # --- Bot config ---
-TOKEN = "ВАШ_ТОКЕН_ТУТ"  # <-- вставь свой токен!
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]  # <-- токен только из Render-секретов!
 TMP_DIR = "temp_files"
 if not os.path.exists(TMP_DIR):
     os.makedirs(TMP_DIR)
