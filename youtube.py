@@ -22,6 +22,7 @@ from telegram.ext import (
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from google.auth.transport.requests import Request
 
 # --- YouTube API config ---
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
@@ -39,17 +40,45 @@ WAITING_ARCHIVE_CHOICE, WAITING_CHOICE, WAITING_TEMPLATE_TITLE_INPUT, WAITING_TE
 
 user_data_store = {}
 
+# --- Authorization commands ---
+async def authorize(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+    auth_url, _ = flow.authorization_url(prompt="consent")
+    user_data_store.setdefault(chat_id, {})["flow"] = flow
+    await update.message.reply_text(
+        "Перейдите по ссылке и предоставьте доступ к YouTube, затем пришлите код командой /auth <код>:\n" + auth_url
+    )
+
+async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    flow = user_data_store.get(chat_id, {}).get("flow")
+    if not flow:
+        await update.message.reply_text("Сначала выполните /authorize")
+        return
+    if not context.args:
+        await update.message.reply_text("Пожалуйста, отправьте код в виде /auth <код>")
+        return
+    code = context.args[0]
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    with open(CREDENTIALS_PICKLE, "wb") as token:
+        pickle.dump(creds, token)
+    user_data_store[chat_id].pop("flow", None)
+    await update.message.reply_text("Авторизация успешна!")
+
 # --- YouTube auth ---
 def get_authenticated_service():
     creds = None
     if os.path.exists(CREDENTIALS_PICKLE):
         with open(CREDENTIALS_PICKLE, "rb") as token:
             creds = pickle.load(token)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
     if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
-        creds = flow.run_local_server(port=0)
-        with open(CREDENTIALS_PICKLE, "wb") as token:
-            pickle.dump(creds, token)
+        raise RuntimeError("YouTube authorization required. Use /authorize in the bot")
+    with open(CREDENTIALS_PICKLE, "wb") as token:
+        pickle.dump(creds, token)
     return build("youtube", "v3", credentials=creds)
 
 def upload_video(youtube, video_file, title, description, tags, publish_at_utc_iso):
@@ -393,7 +422,11 @@ async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет видео для загрузки. Сначала обработайте файлы командой /process.")
         return WAITING_SCHEDULE
 
-    youtube = get_authenticated_service()
+    try:
+        youtube = get_authenticated_service()
+    except RuntimeError:
+        await update.message.reply_text("Требуется авторизация. Выполните команду /authorize")
+        return WAITING_SCHEDULE
     start_date = datetime.now(timezone.utc).replace(hour=21, minute=0, second=0, microsecond=0) + timedelta(days=1)
     publish_dates = [ (start_date + timedelta(days=interval_days * i)).isoformat() for i in range(len(videos_data))]
 
@@ -452,6 +485,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     application = ApplicationBuilder().token(TOKEN).build()
+
+    application.add_handler(CommandHandler("authorize", authorize))
+    application.add_handler(CommandHandler("auth", auth))
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
