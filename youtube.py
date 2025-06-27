@@ -358,10 +358,83 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Изображение '{message.document.file_name}' загружено.")
         return WAITING_FILES
 
+<<<<<<< codex/приветствие
+    await update.message.reply_text("Пожалуйста, загружайте только MP3 и JPG/JPEG/PNG файлы.")
+    return WAITING_FILES
+
+def parse_beat_metadata_perfect(filename):
+    import re
+    import os
+
+    name = os.path.splitext(filename)[0].strip()
+    title = None
+    if '-' in name:
+        *before, after = name.split('-')
+        title = after.strip()
+        before = ' '.join(before).strip()
+    else:
+        before = name
+
+    parts = before.split()
+    bpm = None
+    key = None
+    nicks = []
+    authors = []
+
+    bpm_pat = re.compile(r'^(\d{2,3})\s?BPM$', re.IGNORECASE)
+    key_pat = re.compile(r'^([A-Ga-g][#b]?)(maj|min|MAJ|MIN|m|M)?(?:\s*-?\d{1,3}(cent)?)?$', re.IGNORECASE)
+
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if part.startswith('@'):
+            nicks.append(part)
+        elif bpm_pat.match(part):
+            bpm = bpm_pat.match(part).group(1)
+        elif re.match(r'^\d{2,3}$', part):
+            if i+1 < len(parts) and parts[i+1].lower().startswith('bpm'):
+                bpm = part
+                i += 1
+            else:
+                bpm = part
+        elif key_pat.match(part):
+            key_block = [part]
+            j = i+1
+            while j < len(parts) and (parts[j].lower() in ['maj', 'min', 'm'] or 'cent' in parts[j].lower() or parts[j].startswith('-')):
+                key_block.append(parts[j])
+                j += 1
+            key = ' '.join(key_block)
+            i = j - 1
+        i += 1
+
+    if not title:
+        for idx, part in enumerate(parts):
+            if not part.startswith('@') and not bpm_pat.match(part) and not re.match(r'^\d{2,3}$', part) and not key_pat.match(part):
+                title = part
+                break
+
+    skip_list = {title, bpm, key}
+    for part in parts:
+        if (part not in skip_list and not part.startswith('@')
+            and not bpm_pat.match(part) and not re.match(r'^\d{2,3}$', part)
+            and not key_pat.match(part) and len(part) > 1):
+            authors.append(part)
+    authors.extend(nicks)
+
+    return {
+        "title": title or "",
+        "bpm": bpm or "",
+        "key": key or "",
+        "authors": [a for a in authors if len(a) > 1]
+    }
+
+async def process_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+=======
     await update.message.reply_text("Пожалуйста, загружайте только MP3, JPG/JPEG/PNG или архивы .zip.")
     return WAITING_FILES
 
 async def process_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+>>>>>>> main
     chat_id = update.effective_chat.id
     if chat_id not in user_data_store:
         await update.message.reply_text("Нет загруженных файлов. Используйте /start для начала.")
@@ -435,6 +508,34 @@ async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     template = user_data_store[chat_id].get("template")
     use_archive = user_data_store[chat_id].get("use_archive")
 
+<<<<<<< codex/приветствие
+    for i, (video, publish_date) in enumerate(zip(videos_data, publish_dates), 1):
+        beat_metadata = parse_beat_metadata_perfect(os.path.basename(video["video_path"]).replace('.mp4', '.mp3'))
+
+        beat_title = beat_metadata["title"].strip()
+        bpm = beat_metadata["bpm"]
+        key = beat_metadata["key"]
+        authors = ', '.join(beat_metadata["authors"]) if beat_metadata["authors"] else "unknown"
+
+        yt_title = f'free nettspend x osama type beat "{beat_title}"'
+        key_line = f"KEY: {key}," if key else ""
+        bpm_line = f"BPM {bpm}," if bpm else ""
+        prod_line = f"FOR SC MUST CREDIT: {authors}"
+        yt_desc = f"{key_line} {bpm_line} {prod_line}".strip().replace(" ,", ",").replace("  ", " ")
+
+        if template:
+            yt_title = f'{template["title"]} "{beat_title}"'
+            yt_desc = template["description"]
+            tags = template["tags"]
+        else:
+            tags = ["beat", "hiphop", "rap", beat_title.lower()]
+
+        await update.message.reply_text(f"Загружаю видео {i} на YouTube с публикацией {publish_date}...")
+        upload_video(youtube, video["video_path"], yt_title, yt_desc, tags, publish_date)
+
+        with open(video["video_path"], "rb") as video_file:
+            await update.message.reply_video(video_file, caption=f"Видео {i} из {len(videos_data)}")
+=======
     for i, (video, publish_date) in enumerate(zip(videos_data, publish_dates), 1):
         if use_archive:
             beat_metadata = video["beat_metadata"]
@@ -466,6 +567,7 @@ async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         with open(video["video_path"], "rb") as video_file:
             await update.message.reply_video(video_file, caption=f"Видео {i} из {len(videos_data)}")
+>>>>>>> main
 
     # Очистка
     shutil.rmtree(os.path.join(TMP_DIR, f"{chat_id}_mp3"), ignore_errors=True)
