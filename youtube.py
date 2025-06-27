@@ -34,6 +34,7 @@ TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]  # <-- токен только из Ren
 TMP_DIR = "temp_files"
 if not os.path.exists(TMP_DIR):
     os.makedirs(TMP_DIR)
+MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MB
 
 # --- Conversation states ---
 WAITING_ARCHIVE_CHOICE, WAITING_CHOICE, WAITING_TEMPLATE_TITLE_INPUT, WAITING_TEMPLATE_DESCRIPTION, WAITING_TEMPLATE_TAGS, WAITING_FILES, WAITING_SCHEDULE = range(7)
@@ -308,6 +309,9 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if use_archive:
         # Только архивы .zip
         if message.document and message.document.file_name.lower().endswith(".zip"):
+            if message.document.file_size and message.document.file_size > MAX_FILE_SIZE_BYTES:
+                await update.message.reply_text("Размер архива превышает 500 МБ.")
+                return WAITING_FILES
             file = await message.document.get_file()
             folder = os.path.join(TMP_DIR, f"{chat_id}_archive")
             os.makedirs(folder, exist_ok=True)
@@ -323,6 +327,9 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # mp3 как document
     if message.document and message.document.file_name.lower().endswith(".mp3"):
+        if message.document.file_size and message.document.file_size > MAX_FILE_SIZE_BYTES:
+            await update.message.reply_text("MP3 файл превышает 500 МБ.")
+            return WAITING_FILES
         file = await message.document.get_file()
         folder = os.path.join(TMP_DIR, f"{chat_id}_mp3")
         os.makedirs(folder, exist_ok=True)
@@ -335,6 +342,9 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # mp3 как audio
     if message.audio and message.audio.mime_type == "audio/mpeg":
+        if message.audio.file_size and message.audio.file_size > MAX_FILE_SIZE_BYTES:
+            await update.message.reply_text("MP3 аудио превышает 500 МБ.")
+            return WAITING_FILES
         file = await message.audio.get_file()
         folder = os.path.join(TMP_DIR, f"{chat_id}_mp3")
         os.makedirs(folder, exist_ok=True)
@@ -347,6 +357,9 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # картинки
     if message.document and message.document.file_name.lower().endswith((".jpg", ".jpeg", ".png")):
+        if message.document.file_size and message.document.file_size > MAX_FILE_SIZE_BYTES:
+            await update.message.reply_text("Изображение превышает 500 МБ.")
+            return WAITING_FILES
         file = await message.document.get_file()
         folder = os.path.join(TMP_DIR, f"{chat_id}_jpg")
         os.makedirs(folder, exist_ok=True)
