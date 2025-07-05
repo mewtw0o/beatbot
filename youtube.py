@@ -5,6 +5,7 @@ import subprocess
 import asyncio
 import re
 import pickle
+import sqlite3
 import zipfile
 from datetime import datetime, timedelta, timezone
 
@@ -27,7 +28,7 @@ from google.auth.transport.requests import Request
 # --- YouTube API config ---
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 CLIENT_SECRETS_FILE = "client_secrets.json"
-CREDENTIALS_PICKLE = "youtube_credentials.pkl"
+CREDENTIALS_DB = "credentials.db"
 
 # --- Bot config ---
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]  # <-- токен только из Render-секретов!
@@ -40,6 +41,37 @@ MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MB
 WAITING_ARCHIVE_CHOICE, WAITING_CHOICE, WAITING_TEMPLATE_TITLE_INPUT, WAITING_TEMPLATE_DESCRIPTION, WAITING_TEMPLATE_TAGS, WAITING_FILES, WAITING_SCHEDULE = range(7)
 
 user_data_store = {}
+
+# --- SQLite helpers ---
+def init_db():
+    conn = sqlite3.connect(CREDENTIALS_DB)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS credentials (user_id INTEGER PRIMARY KEY, creds BLOB)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_credentials(user_id: int, creds):
+    conn = sqlite3.connect(CREDENTIALS_DB)
+    conn.execute(
+        "REPLACE INTO credentials (user_id, creds) VALUES (?, ?)",
+        (user_id, pickle.dumps(creds)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_credentials(user_id: int):
+    conn = sqlite3.connect(CREDENTIALS_DB)
+    cursor = conn.execute(
+        "SELECT creds FROM credentials WHERE user_id = ?", (user_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return pickle.loads(row[0])
+    return None
 
 # --- Authorization commands ---
 async def authorize(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -63,23 +95,18 @@ async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0]
     flow.fetch_token(code=code)
     creds = flow.credentials
-    with open(CREDENTIALS_PICKLE, "wb") as token:
-        pickle.dump(creds, token)
+    save_credentials(chat_id, creds)
     user_data_store[chat_id].pop("flow", None)
     await update.message.reply_text("Авторизация успешна!")
 
 # --- YouTube auth ---
-def get_authenticated_service():
-    creds = None
-    if os.path.exists(CREDENTIALS_PICKLE):
-        with open(CREDENTIALS_PICKLE, "rb") as token:
-            creds = pickle.load(token)
+def get_authenticated_service(chat_id: int):
+    creds = load_credentials(chat_id)
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
+        save_credentials(chat_id, creds)
     if not creds or not creds.valid:
         raise RuntimeError("YouTube authorization required. Use /authorize in the bot")
-    with open(CREDENTIALS_PICKLE, "wb") as token:
-        pickle.dump(creds, token)
     return build("youtube", "v3", credentials=creds)
 
 def upload_video(youtube, video_file, title, description, tags, publish_at_utc_iso):
@@ -436,7 +463,7 @@ async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return WAITING_SCHEDULE
 
     try:
-        youtube = get_authenticated_service()
+        youtube = get_authenticated_service(chat_id)
     except RuntimeError:
         await update.message.reply_text("Требуется авторизация. Выполните команду /authorize")
         return WAITING_SCHEDULE
@@ -497,6 +524,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
+    init_db()
     application = ApplicationBuilder().token(TOKEN).build()
 
     application.add_handler(CommandHandler("authorize", authorize))
