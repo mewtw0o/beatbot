@@ -5,8 +5,6 @@ import subprocess
 import asyncio
 import re
 import pickle
-import sqlite3
-import zipfile
 from datetime import datetime, timedelta, timezone
 
 from PIL import Image
@@ -23,90 +21,34 @@ from telegram.ext import (
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from google.auth.transport.requests import Request
 
 # --- YouTube API config ---
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-CLIENT_SECRETS_FILE = "client_secrets.json"
-CREDENTIALS_DB = "credentials.db"
+CLIENT_SECRETS_FILE = os.path.join(os.path.dirname(__file__), "client_secrets.json")
+CREDENTIALS_PICKLE = "youtube_credentials.pkl"
 
 # --- Bot config ---
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]  # <-- токен только из Render-секретов!
 TMP_DIR = "temp_files"
 if not os.path.exists(TMP_DIR):
     os.makedirs(TMP_DIR)
-MAX_FILE_SIZE_BYTES = 500 * 1024 * 1024  # 500 MB
 
 # --- Conversation states ---
-WAITING_ARCHIVE_CHOICE, WAITING_CHOICE, WAITING_TEMPLATE_TITLE_INPUT, WAITING_TEMPLATE_DESCRIPTION, WAITING_TEMPLATE_TAGS, WAITING_FILES, WAITING_SCHEDULE = range(7)
+WAITING_VIDEO_MODE, WAITING_CHOICE, WAITING_TEMPLATE_TITLE_INPUT, WAITING_TEMPLATE_DESCRIPTION, WAITING_TEMPLATE_TAGS, WAITING_FILES, WAITING_SCHEDULE, WAITING_AUTH_CODE = range(8)
 
 user_data_store = {}
 
-# --- SQLite helpers ---
-def init_db():
-    conn = sqlite3.connect(CREDENTIALS_DB)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS credentials (user_id INTEGER PRIMARY KEY, creds BLOB)"
-    )
-    conn.commit()
-    conn.close()
-
-
-def save_credentials(user_id: int, creds):
-    conn = sqlite3.connect(CREDENTIALS_DB)
-    conn.execute(
-        "REPLACE INTO credentials (user_id, creds) VALUES (?, ?)",
-        (user_id, pickle.dumps(creds)),
-    )
-    conn.commit()
-    conn.close()
-
-
-def load_credentials(user_id: int):
-    conn = sqlite3.connect(CREDENTIALS_DB)
-    cursor = conn.execute(
-        "SELECT creds FROM credentials WHERE user_id = ?", (user_id,)
-    )
-    row = cursor.fetchone()
-    conn.close()
-    if row:
-        return pickle.loads(row[0])
-    return None
-
-# --- Authorization commands ---
-async def authorize(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
-    auth_url, _ = flow.authorization_url(prompt="consent")
-    user_data_store.setdefault(chat_id, {})["flow"] = flow
-    await update.message.reply_text(
-        "Перейдите по ссылке и предоставьте доступ к YouTube, затем пришлите код командой /auth <код>:\n" + auth_url
-    )
-
-async def auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    flow = user_data_store.get(chat_id, {}).get("flow")
-    if not flow:
-        await update.message.reply_text("Сначала выполните /authorize")
-        return
-    if not context.args:
-        await update.message.reply_text("Пожалуйста, отправьте код в виде /auth <код>")
-        return
-    code = context.args[0]
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-    save_credentials(chat_id, creds)
-    user_data_store[chat_id].pop("flow", None)
-    await update.message.reply_text("Авторизация успешна!")
-
 # --- YouTube auth ---
-def get_authenticated_service(chat_id: int):
-    creds = load_credentials(chat_id)
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(chat_id, creds)
+def get_authenticated_service():
+    creds = None
+    if os.path.exists(CREDENTIALS_PICKLE):
+        with open(CREDENTIALS_PICKLE, "rb") as token:
+            creds = pickle.load(token)
     if not creds or not creds.valid:
-        raise RuntimeError("YouTube authorization required. Use /authorize in the bot")
+        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
+        creds = flow.run_local_server(port=0)
+        with open(CREDENTIALS_PICKLE, "wb") as token:
+            pickle.dump(creds, token)
     return build("youtube", "v3", credentials=creds)
 
 def upload_video(youtube, video_file, title, description, tags, publish_at_utc_iso):
@@ -136,76 +78,13 @@ def upload_video(youtube, video_file, title, description, tags, publish_at_utc_i
     print("Upload complete.")
     return response
 
-# --- Beat filename parser ---
-def parse_beat_metadata_perfect(filename):
-    import re
-    import os
-
-    name = os.path.splitext(filename)[0].strip()
-    title = None
-    if '-' in name:
-        *before, after = name.split('-')
-        title = after.strip()
-        before = ' '.join(before).strip()
-    else:
-        before = name
-
-    parts = before.split()
-    bpm = None
-    key = None
-    nicks = []
-    authors = []
-
-    bpm_pat = re.compile(r'^(\d{2,3})\s?BPM$', re.IGNORECASE)
-    key_pat = re.compile(r'^([A-Ga-g][#b]?)(maj|min|MAJ|MIN|m|M)?(?:\s*-?\d{1,3}(cent)?)?$', re.IGNORECASE)
-
-    i = 0
-    while i < len(parts):
-        part = parts[i]
-        if part.startswith('@'):
-            nicks.append(part)
-        elif bpm_pat.match(part):
-            bpm = bpm_pat.match(part).group(1)
-        elif re.match(r'^\d{2,3}$', part):
-            if i+1 < len(parts) and parts[i+1].lower().startswith('bpm'):
-                bpm = part
-                i += 1
-            else:
-                bpm = part
-        elif key_pat.match(part):
-            key_block = [part]
-            j = i+1
-            while j < len(parts) and (parts[j].lower() in ['maj', 'min', 'm'] or 'cent' in parts[j].lower() or parts[j].startswith('-')):
-                key_block.append(parts[j])
-                j += 1
-            key = ' '.join(key_block)
-            i = j - 1
-        i += 1
-
-    if not title:
-        for idx, part in enumerate(parts):
-            if not part.startswith('@') and not bpm_pat.match(part) and not re.match(r'^\d{2,3}$', part) and not key_pat.match(part):
-                title = part
-                break
-
-    skip_list = {title, bpm, key}
-    for part in parts:
-        if (part not in skip_list and not part.startswith('@')
-            and not bpm_pat.match(part) and not re.match(r'^\d{2,3}$', part)
-            and not key_pat.match(part) and len(part) > 1):
-            authors.append(part)
-    authors.extend(nicks)
-
-    return {
-        "title": title or "",
-        "bpm": bpm or "",
-        "key": key or "",
-        "authors": [a for a in authors if len(a) > 1]
-    }
-
 # --- Image processing ---
-def process_image(input_path: str, output_path: str):
-    base_width, base_height = 1920, 1080
+def process_image(input_path: str, output_path: str, mode="normal"):
+    # mode: "normal" = 1920x1080, "shorts" = 1080x1920
+    if mode == "shorts":
+        base_width, base_height = 1080, 1920
+    else:
+        base_width, base_height = 1920, 1080
     with Image.open(input_path) as img:
         img_ratio = img.width / img.height
         base_ratio = base_width / base_height
@@ -239,42 +118,8 @@ def create_video(image_path: str, audio_path: str, output_path: str):
     ]
     subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-# --- Blocking video processing for archive ---
-def blocking_process_files_archive(chat_id, archive_path):
-    output_folder = os.path.join(TMP_DIR, f'{chat_id}_output')
-    os.makedirs(output_folder, exist_ok=True)
-    mp3_files = []
-    jpg_files = []
-    # Распаковать архив
-    with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-        zip_ref.extractall(output_folder)
-    # Найти все mp3 и картинки
-    for root, dirs, files in os.walk(output_folder):
-        for f in files:
-            ext = f.lower().split('.')[-1]
-            full_path = os.path.join(root, f)
-            if ext == "mp3":
-                mp3_files.append(full_path)
-            elif ext in ("jpg", "jpeg", "png"):
-                jpg_files.append(full_path)
-    mp3_files.sort()
-    jpg_files.sort()
-    random.shuffle(jpg_files)
-    videos_data = []
-    for i, (mp3_path, jpg_path) in enumerate(zip(mp3_files, jpg_files), 1):
-        processed_img_path = os.path.join(output_folder, f'proc_img_{i}.jpg')
-        video_path = os.path.join(output_folder, f'video_{i}.mp4')
-        process_image(jpg_path, processed_img_path)
-        create_video(processed_img_path, mp3_path, video_path)
-        beat_metadata = parse_beat_metadata_perfect(os.path.basename(mp3_path))
-        videos_data.append({
-            "video_path": video_path,
-            "beat_metadata": beat_metadata
-        })
-    return videos_data
-
-# --- Blocking video processing for manual mode ---
-def blocking_process_files_manual(chat_id, mp3_files, jpg_files):
+# --- Blocking video processing ---
+def blocking_process_files(chat_id, mp3_files, jpg_files, video_mode):
     output_folder = os.path.join(TMP_DIR, f'{chat_id}_output')
     os.makedirs(output_folder, exist_ok=True)
     random.shuffle(jpg_files)
@@ -282,11 +127,10 @@ def blocking_process_files_manual(chat_id, mp3_files, jpg_files):
     for i, (mp3_path, jpg_path) in enumerate(zip(mp3_files, jpg_files), 1):
         processed_img_path = os.path.join(output_folder, f'proc_img_{i}.jpg')
         video_path = os.path.join(output_folder, f'video_{i}.mp4')
-        process_image(jpg_path, processed_img_path)
+        process_image(jpg_path, processed_img_path, mode=video_mode)
         create_video(processed_img_path, mp3_path, video_path)
         videos_data.append({
-            "video_path": video_path,
-            "beat_name": os.path.splitext(os.path.basename(mp3_path))[0]
+            "video_path": video_path
         })
     return videos_data
 
@@ -295,68 +139,98 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_data_store.setdefault(chat_id, {})
     keyboard = [
-        ["Архивом (рекомендуется)"],
-        ["По отдельности (без автопарсинга)"]
+        ["YouTube Shorts (вертикальное 9:16)"],
+        ["Обычный YouTube (горизонтальное 16:9)"]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text(
-        "Как хотите загружать файлы?\n\n"
-        "Архивом (zip/rar) — бот сам распарсит BPM, Key, название, авторов из названия файлов!\n"
-        "По отдельности — вручную, парсинга не будет.",
+        "В каком формате делать видео?\n\n"
+        "— YouTube Shorts (вертикальное 9:16)\n"
+        "— Обычный YouTube (горизонтальное 16:9)",
         reply_markup=reply_markup
     )
-    return WAITING_ARCHIVE_CHOICE
+    return WAITING_VIDEO_MODE
 
-async def archive_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def video_mode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text.strip().lower()
-    if "архив" in text:
-        user_data_store[chat_id]["use_archive"] = True
-        await update.message.reply_text("Отправьте архив с файлами (mp3 и картинки). После загрузки нажмите /process")
-        user_data_store[chat_id]["archives"] = []
-        return WAITING_FILES
+    if "short" in text:
+        user_data_store[chat_id]["video_mode"] = "shorts"
     else:
-        user_data_store[chat_id]["use_archive"] = False
+        user_data_store[chat_id]["video_mode"] = "normal"
+    keyboard = [
+        ["Создать шаблон для всех видео"],
+        ["Загружать видео без шаблона"]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "Выберите, что вы хотите сделать:\n"
+        "— Создать шаблон (название, описание, теги) для всех загружаемых видео\n"
+        "— Или загружать видео с заполнением данных вручную",
+        reply_markup=reply_markup
+    )
+    return WAITING_CHOICE
+
+async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = update.message.text.strip().lower()
+    if text == "создать шаблон для всех видео":
         await update.message.reply_text(
-            "Загружайте mp3 и картинки по отдельности. После загрузки всех файлов нажмите /process"
+            "Введите желаемое название видео (пример: (free) nettspend x osamason type beat):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return WAITING_TEMPLATE_TITLE_INPUT
+    elif text == "загружать видео без шаблона":
+        user_data_store[chat_id]["template"] = None
+        await update.message.reply_text(
+            "Хорошо, загружайте MP3 и картинки.\n"
+            "После загрузки всех файлов нажмите /process",
+            reply_markup=ReplyKeyboardMarkup([["/process"]], resize_keyboard=True, one_time_keyboard=True)
         )
         user_data_store[chat_id]["mp3_files"] = []
         user_data_store[chat_id]["jpg_files"] = []
         return WAITING_FILES
+    else:
+        await update.message.reply_text("Пожалуйста, выберите опцию из клавиатуры.")
+        return WAITING_CHOICE
+
+async def receive_template_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_data_store[chat_id]["template"] = {}
+    user_data_store[chat_id]["template"]["title"] = update.message.text.strip()
+    await update.message.reply_text("Введите описание всех последующих видео:")
+    return WAITING_TEMPLATE_DESCRIPTION
+
+async def receive_template_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user_data_store[chat_id]["template"]["description"] = update.message.text.strip()
+    await update.message.reply_text("Введите теги через запятую (пример: beat, hiphop, rap):")
+    return WAITING_TEMPLATE_TAGS
+
+async def receive_template_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    raw_tags = update.message.text.strip()
+    tags = [tag.strip() for tag in raw_tags.split(",") if tag.strip()]
+    user_data_store[chat_id]["template"]["tags"] = tags
+    await update.message.reply_text(
+        "Шаблон сохранён! Теперь загружайте MP3 и картинки.\n"
+        "После загрузки всех файлов нажмите /process",
+        reply_markup=ReplyKeyboardMarkup([["/process"]], resize_keyboard=True, one_time_keyboard=True)
+    )
+    user_data_store[chat_id]["mp3_files"] = []
+    user_data_store[chat_id]["jpg_files"] = []
+    return WAITING_FILES
 
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in user_data_store:
         await update.message.reply_text("Пожалуйста, используйте /start для начала.")
-        return WAITING_ARCHIVE_CHOICE
+        return WAITING_CHOICE
 
-    use_archive = user_data_store[chat_id].get("use_archive")
     message = update.message
-
-    if use_archive:
-        # Только архивы .zip
-        if message.document and message.document.file_name.lower().endswith(".zip"):
-            if message.document.file_size and message.document.file_size > MAX_FILE_SIZE_BYTES:
-                await update.message.reply_text("Размер архива превышает 500 МБ.")
-                return WAITING_FILES
-            file = await message.document.get_file()
-            folder = os.path.join(TMP_DIR, f"{chat_id}_archive")
-            os.makedirs(folder, exist_ok=True)
-            safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', message.document.file_name)
-            file_path = os.path.join(folder, safe_name)
-            await file.download_to_drive(file_path)
-            user_data_store[chat_id]["archives"].append(file_path)
-            await update.message.reply_text(f"Архив '{message.document.file_name}' загружен.")
-            return WAITING_FILES
-        else:
-            await update.message.reply_text("Пожалуйста, отправьте архив .zip.")
-            return WAITING_FILES
 
     # mp3 как document
     if message.document and message.document.file_name.lower().endswith(".mp3"):
-        if message.document.file_size and message.document.file_size > MAX_FILE_SIZE_BYTES:
-            await update.message.reply_text("MP3 файл превышает 500 МБ.")
-            return WAITING_FILES
         file = await message.document.get_file()
         folder = os.path.join(TMP_DIR, f"{chat_id}_mp3")
         os.makedirs(folder, exist_ok=True)
@@ -369,9 +243,6 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # mp3 как audio
     if message.audio and message.audio.mime_type == "audio/mpeg":
-        if message.audio.file_size and message.audio.file_size > MAX_FILE_SIZE_BYTES:
-            await update.message.reply_text("MP3 аудио превышает 500 МБ.")
-            return WAITING_FILES
         file = await message.audio.get_file()
         folder = os.path.join(TMP_DIR, f"{chat_id}_mp3")
         os.makedirs(folder, exist_ok=True)
@@ -384,13 +255,9 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # картинки
     if message.document and message.document.file_name.lower().endswith((".jpg", ".jpeg", ".png")):
-        if message.document.file_size and message.document.file_size > MAX_FILE_SIZE_BYTES:
-            await update.message.reply_text("Изображение превышает 500 МБ.")
-            return WAITING_FILES
         file = await message.document.get_file()
         folder = os.path.join(TMP_DIR, f"{chat_id}_jpg")
         os.makedirs(folder, exist_ok=True)
-        ext = os.path.splitext(message.document.file_name)[1]
         safe_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', message.document.file_name)
         file_path = os.path.join(folder, safe_name)
         await file.download_to_drive(file_path)
@@ -398,7 +265,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Изображение '{message.document.file_name}' загружено.")
         return WAITING_FILES
 
-    await update.message.reply_text("Пожалуйста, загружайте только MP3, JPG/JPEG/PNG или архивы .zip.")
+    await update.message.reply_text("Пожалуйста, загружайте только MP3 и JPG/JPEG/PNG файлы.")
     return WAITING_FILES
 
 async def process_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -407,31 +274,22 @@ async def process_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет загруженных файлов. Используйте /start для начала.")
         return WAITING_FILES
 
-    use_archive = user_data_store[chat_id].get("use_archive")
-    videos_data = []
+    mp3_files = user_data_store[chat_id].get("mp3_files", [])
+    jpg_files = user_data_store[chat_id].get("jpg_files", [])
+    template = user_data_store[chat_id].get("template")
+    video_mode = user_data_store[chat_id].get("video_mode", "normal")
 
-    if use_archive:
-        archives = user_data_store[chat_id].get("archives", [])
-        if not archives:
-            await update.message.reply_text("Нет загруженных архивов. Отправьте архив .zip и нажмите /process.")
-            return WAITING_FILES
-        await update.message.reply_text(f"Начинаю обработку файлов из архива...")
-        loop = asyncio.get_running_loop()
-        videos_data = await loop.run_in_executor(None, blocking_process_files_archive, chat_id, archives[0])
-        user_data_store[chat_id]["videos_data"] = videos_data
-    else:
-        mp3_files = user_data_store[chat_id].get("mp3_files", [])
-        jpg_files = user_data_store[chat_id].get("jpg_files", [])
-        if len(mp3_files) == 0 or len(jpg_files) == 0:
-            await update.message.reply_text("Нет загруженных MP3 или JPG файлов.")
-            return WAITING_FILES
-        if len(mp3_files) != len(jpg_files):
-            await update.message.reply_text(f"Количество MP3 ({len(mp3_files)}) и JPG ({len(jpg_files)}) не совпадает.")
-            return WAITING_FILES
-        await update.message.reply_text(f"Начинаю обработку {len(mp3_files)} видео...")
-        loop = asyncio.get_running_loop()
-        videos_data = await loop.run_in_executor(None, blocking_process_files_manual, chat_id, mp3_files, jpg_files)
-        user_data_store[chat_id]["videos_data"] = videos_data
+    if len(mp3_files) == 0 or len(jpg_files) == 0:
+        await update.message.reply_text("Нет загруженных MP3 или JPG файлов.")
+        return WAITING_FILES
+    if len(mp3_files) != len(jpg_files):
+        await update.message.reply_text(f"Количество MP3 ({len(mp3_files)}) и JPG ({len(jpg_files)}) не совпадает.")
+        return WAITING_FILES
+
+    await update.message.reply_text(f"Начинаю обработку {len(mp3_files)} видео...")
+    loop = asyncio.get_running_loop()
+    videos_data = await loop.run_in_executor(None, blocking_process_files, chat_id, mp3_files, jpg_files, video_mode)
+    user_data_store[chat_id]["videos_data"] = videos_data
 
     keyboard = [["/daily", "/every_other_day", "/weekly"]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
@@ -445,7 +303,7 @@ async def process_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_SCHEDULE
 
 async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id if hasattr(update.message, 'chat_id') else update.effective_chat.id
+    chat_id = update.effective_chat.id
     cmd = update.message.text.lower()
     mapping = {
         "/daily": 1,
@@ -462,47 +320,26 @@ async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Нет видео для загрузки. Сначала обработайте файлы командой /process.")
         return WAITING_SCHEDULE
 
-    try:
-        youtube = get_authenticated_service(chat_id)
-    except RuntimeError:
-        await update.message.reply_text("Требуется авторизация. Выполните команду /authorize")
-        return WAITING_SCHEDULE
+    youtube = get_authenticated_service()
     start_date = datetime.now(timezone.utc).replace(hour=21, minute=0, second=0, microsecond=0) + timedelta(days=1)
     publish_dates = [ (start_date + timedelta(days=interval_days * i)).isoformat() for i in range(len(videos_data))]
 
     await update.message.reply_text(f"Начинаю загрузку {len(videos_data)} видео на YouTube с периодичностью каждые {interval_days} дней...")
 
     template = user_data_store[chat_id].get("template")
-    use_archive = user_data_store[chat_id].get("use_archive")
 
     for i, (video, publish_date) in enumerate(zip(videos_data, publish_dates), 1):
-        if use_archive:
-            beat_metadata = video["beat_metadata"]
-            beat_title = beat_metadata["title"].strip()
-            bpm = beat_metadata["bpm"]
-            key = beat_metadata["key"]
-            authors = ', '.join(beat_metadata["authors"]) if beat_metadata["authors"] else "unknown"
-        else:
-            beat_title = video.get("beat_name", "Unknown").strip()
-            bpm = ""
-            key = ""
-            authors = ""
-
-        yt_title = f'free nettspend x osama type beat "{beat_title}"'
-        key_line = f"KEY: {key}," if key else ""
-        bpm_line = f"BPM {bpm}," if bpm else ""
-        prod_line = f"FOR SC MUST CREDIT: {authors}" if authors else ""
-        yt_desc = f"{key_line} {bpm_line} {prod_line}".strip().replace(" ,", ",").replace("  ", " ")
-
         if template:
-            yt_title = f'{template["title"]} "{beat_title}"'
-            yt_desc = template["description"]
+            title = template["title"]
+            description = template["description"]
             tags = template["tags"]
         else:
-            tags = ["beat", "hiphop", "rap", beat_title.lower()]
+            title = ""
+            description = "Подписывайтесь и слушайте больше битов!"
+            tags = ["beat", "hiphop", "rap"]
 
         await update.message.reply_text(f"Загружаю видео {i} на YouTube с публикацией {publish_date}...")
-        upload_video(youtube, video["video_path"], yt_title, yt_desc, tags, publish_date)
+        upload_video(youtube, video["video_path"], title, description, tags, publish_date)
 
         with open(video["video_path"], "rb") as video_file:
             await update.message.reply_video(video_file, caption=f"Видео {i} из {len(videos_data)}")
@@ -511,7 +348,6 @@ async def set_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     shutil.rmtree(os.path.join(TMP_DIR, f"{chat_id}_mp3"), ignore_errors=True)
     shutil.rmtree(os.path.join(TMP_DIR, f"{chat_id}_jpg"), ignore_errors=True)
     shutil.rmtree(os.path.join(TMP_DIR, f"{chat_id}_output"), ignore_errors=True)
-    shutil.rmtree(os.path.join(TMP_DIR, f"{chat_id}_archive"), ignore_errors=True)
 
     user_data_store.pop(chat_id, None)
     await update.message.reply_text("Все видео загружены и запланированы на публикацию!")
@@ -524,16 +360,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    init_db()
     application = ApplicationBuilder().token(TOKEN).build()
-
-    application.add_handler(CommandHandler("authorize", authorize))
-    application.add_handler(CommandHandler("auth", auth))
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            WAITING_ARCHIVE_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, archive_choice_handler)],
+            WAITING_VIDEO_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, video_mode_handler)],
+            WAITING_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, choice_handler)],
+            WAITING_TEMPLATE_TITLE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_template_title)],
+            WAITING_TEMPLATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_template_description)],
+            WAITING_TEMPLATE_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_template_tags)],
             WAITING_FILES: [
                 MessageHandler(filters.Document.ALL | filters.AUDIO, receive_file),
                 CommandHandler("process", process_files),
