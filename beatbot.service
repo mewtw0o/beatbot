@@ -1,0 +1,18 @@
+[Unit]
+Description=BeatBot Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/beatbot
+Environment=PATH=/home/botuser/beatbot/venv/bin
+ExecStart=/home/botuser/beatbot/venv/bin/python youtube.py
+Restart=always
+RestartSec=10
+
+# Переменные окружения
+Environment=TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+
+[Install]
+WantedBy=multi-user.target
